@@ -1,0 +1,24 @@
+[project]
+name = "ieee33-topology-diffusion"
+version = "0.1.0"
+description = "Topology-conditioned diffusion experiments on the Baran-Wu IEEE 33-bus distribution system"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "networkx>=3.4",
+    "numpy>=2.0",
+    "pandapower>=3.1",
+    "torch>=2.5",
+    "tqdm>=4.67",
+]
+
+[project.scripts]
+ieee33-build = "ieee33_diffusion.build_dataset:main"
+ieee33-run = "ieee33_diffusion.train_infer:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
