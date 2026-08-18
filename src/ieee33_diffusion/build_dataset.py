@@ -27,14 +27,66 @@ class BuildConfig:
     每个负荷的 P、Q 使用同一个乘数，以保持其功率因数不变。
     """
 
-    num_topologies: int = 100
-    samples_per_topology: int = 1000
-    load_low: float = 0.75
-    load_high: float = 1.25
+    num_topologies: int = 300
+    samples_per_topology: int = 500
+    load_low: float = 0.80
+    load_high: float = 1.20
+    voltage_min: float = 0.90
+    voltage_max: float = 1.10
+    require_voltage_feasible: bool = True
     train_ratio: float = 0.70
     val_ratio: float = 0.10
     seed: int = 2026
     max_topology_attempts: int = 100_000
+    max_sample_attempt_factor: int = 100
+
+
+def _validate_config(config: BuildConfig) -> None:
+    """在耗时计算开始前检查构建参数。"""
+
+    if config.num_topologies < 1 or config.samples_per_topology < 1:
+        raise ValueError("num_topologies and samples_per_topology must be positive.")
+    if not 0.0 < config.load_low <= config.load_high:
+        raise ValueError("Require 0 < load_low <= load_high.")
+    if not 0.0 < config.voltage_min < config.voltage_max:
+        raise ValueError("Require 0 < voltage_min < voltage_max.")
+    if not 0.0 < config.train_ratio < 1.0:
+        raise ValueError("train_ratio must lie in (0, 1).")
+    if not 0.0 <= config.val_ratio < 1.0:
+        raise ValueError("val_ratio must lie in [0, 1).")
+    if config.train_ratio + config.val_ratio >= 1.0:
+        raise ValueError("train_ratio + val_ratio must be less than 1.")
+    if config.max_sample_attempt_factor < 1:
+        raise ValueError("max_sample_attempt_factor must be positive.")
+
+
+def _run_power_flow(net: pp.pandapowerNet) -> bool:
+    """运行一次 Newton-Raphson AC 潮流并返回是否收敛。"""
+
+    try:
+        pp.runpp(
+            net,
+            algorithm="nr",
+            init="flat",
+            calculate_voltage_angles=True,
+            max_iteration=30,
+            numba=False,
+        )
+    except pp.LoadflowNotConverged:
+        return False
+    return bool(net.converged)
+
+
+def _voltage_is_feasible(net: pp.pandapowerNet, config: BuildConfig) -> bool:
+    """检查所有节点电压是否位于用户指定的统一标幺范围内。"""
+
+    voltage = net.res_bus.vm_pu.to_numpy(float)
+    tolerance = 1.0e-8
+    return bool(
+        np.isfinite(voltage).all()
+        and np.all(voltage >= config.voltage_min - tolerance)
+        and np.all(voltage <= config.voltage_max + tolerance)
+    )
 
 
 def _master_graph(net: pp.pandapowerNet) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -132,13 +184,14 @@ def generate_topologies(
     edge_index: np.ndarray,
     base_mask: np.ndarray,
     config: BuildConfig,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, int]]:
     """通过随机支路交换游走生成互不重复且潮流可收敛的拓扑。
 
     返回：
         masks: ``[T, 37]``，全部拓扑的候选边掩码。
         parents: ``[T]``，每个拓扑由哪个已有拓扑变换而来。
         actions: ``[T, 2]``，对应 ``[opened_edge_id, closed_edge_id]``。
+        stats: 拓扑候选的尝试次数与各类拒绝次数。
     """
     rng = np.random.default_rng(config.seed)
     num_nodes = len(net.bus)
@@ -149,7 +202,19 @@ def generate_topologies(
     seen = {np.packbits(base_mask).tobytes()}
     current_id = 0
 
+    # 原始 IEEE33 拓扑也必须满足当前模式要求，否则不能作为训练基准。
+    net.line.loc[:, "in_service"] = base_mask
+    if not _run_power_flow(net):
+        raise RuntimeError("The original case33bw topology did not converge.")
+    if config.require_voltage_feasible and not _voltage_is_feasible(net, config):
+        raise RuntimeError(
+            "The original case33bw topology violates the configured voltage bounds."
+        )
+
     attempts = 0
+    rejected_duplicate = 0
+    rejected_power_flow = 0
+    rejected_voltage = 0
     while len(masks) < config.num_topologies and attempts < config.max_topology_attempts:
         attempts += 1
         # 80% 从最新拓扑继续游走，20% 回到历史拓扑分叉，增加拓扑多样性。
@@ -159,21 +224,16 @@ def generate_topologies(
         )
         key = np.packbits(candidate).tobytes()
         if key in seen:
+            rejected_duplicate += 1
             continue
 
         # 树结构合法不代表潮流一定有解，因此还需用基准负荷做一次收敛筛选。
         net.line.loc[:, "in_service"] = candidate
-        try:
-            pp.runpp(
-                net,
-                algorithm="nr",
-                init="flat",
-                calculate_voltage_angles=True,
-                numba=False,
-            )
-        except pp.LoadflowNotConverged:
+        if not _run_power_flow(net):
+            rejected_power_flow += 1
             continue
-        if not bool(net.converged):
+        if config.require_voltage_feasible and not _voltage_is_feasible(net, config):
+            rejected_voltage += 1
             continue
 
         seen.add(key)
@@ -187,10 +247,18 @@ def generate_topologies(
             f"Only generated {len(masks)} unique convergent topologies after "
             f"{attempts} attempts; requested {config.num_topologies}."
         )
+    stats = {
+        "attempts": attempts,
+        "accepted": len(masks),
+        "rejected_duplicate": rejected_duplicate,
+        "rejected_power_flow": rejected_power_flow,
+        "rejected_voltage": rejected_voltage,
+    }
     return (
         np.stack(masks),
         np.asarray(parents, dtype=np.int32),
         np.asarray(actions, dtype=np.int32),
+        stats,
     )
 
 
@@ -291,6 +359,7 @@ def _bus_sums(net: pp.pandapowerNet) -> tuple[np.ndarray, np.ndarray]:
 def build_dataset(output: Path, config: BuildConfig) -> None:
     """构建并保存多拓扑、多运行断面的压缩 NPZ 数据集。"""
 
+    _validate_config(config)
     # 各阶段使用错开的随机种子，使拓扑、切分与负荷扰动彼此可复现且不共用序列。
     rng = np.random.default_rng(config.seed + 2)
     net = pn.case33bw()
@@ -300,9 +369,12 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
         raise ValueError("case33bw bus indices must be contiguous from zero.")
 
     master_edge_index, master_edge_attr, base_mask = _master_graph(net)
-    topology_masks, topology_parent, topology_actions = generate_topologies(
-        net, master_edge_index, base_mask, config
-    )
+    (
+        topology_masks,
+        topology_parent,
+        topology_actions,
+        topology_generation_stats,
+    ) = generate_topologies(net, master_edge_index, base_mask, config)
     # 对模型而言每个辐射拓扑只需 32 个活动边 ID；同时仍保存完整 37 位掩码供比较。
     topology_active_edge_ids = np.stack(
         [np.flatnonzero(mask) for mask in topology_masks]
@@ -317,6 +389,9 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
     sample_topology: list[int] = []
     sample_scale: list[np.ndarray] = []
     sample_quality: list[tuple[int, int, int, int]] = []
+    sample_attempt_count = np.zeros(config.num_topologies, dtype=np.int32)
+    sample_rejected_power_flow = np.zeros(config.num_topologies, dtype=np.int32)
+    sample_rejected_voltage = np.zeros(config.num_topologies, dtype=np.int32)
 
     total = config.num_topologies * config.samples_per_topology
     with tqdm(total=total, desc="AC power-flow samples") as progress:
@@ -326,34 +401,27 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
             attempts = 0
             while accepted < config.samples_per_topology:
                 attempts += 1
-                if attempts > config.samples_per_topology * 50:
+                sample_attempt_count[topology_id] += 1
+                if attempts > config.samples_per_topology * config.max_sample_attempt_factor:
                     raise RuntimeError(
-                        f"Too many failed power flows for topology {topology_id}."
+                        f"Too many rejected samples for topology {topology_id}; "
+                        "consider narrowing the load range or using "
+                        "--allow-voltage-violations."
                     )
                 # 每个负荷独立采样倍率；同一负荷的 P、Q 共用倍率，保持功率因数。
                 scales = rng.uniform(config.load_low, config.load_high, len(net.load))
                 net.load.loc[:, "p_mw"] = base_load_p * scales
                 net.load.loc[:, "q_mvar"] = base_load_q * scales
-                try:
-                    pp.runpp(
-                        net,
-                        algorithm="nr",
-                        init="flat",
-                        calculate_voltage_angles=True,
-                        max_iteration=30,
-                        numba=False,
-                    )
-                except pp.LoadflowNotConverged:
-                    continue
-                if not bool(net.converged):
+                if not _run_power_flow(net):
+                    sample_rejected_power_flow[topology_id] += 1
                     continue
 
                 x0, raw = _bus_sums(net)
-                # 越限样本不直接删除，而是保存质量标记，便于之后设计不同清洗实验。
-                voltage_ok = bool(
-                    np.all(net.res_bus.vm_pu.to_numpy() >= net.bus.min_vm_pu.to_numpy())
-                    and np.all(net.res_bus.vm_pu.to_numpy() <= net.bus.max_vm_pu.to_numpy())
-                )
+                voltage_ok = _voltage_is_feasible(net, config)
+                # 严格模式拒绝电压越限断面；压力模式保留断面并将质量标记置零。
+                if config.require_voltage_feasible and not voltage_ok:
+                    sample_rejected_voltage[topology_id] += 1
+                    continue
                 samples_x0.append(x0)
                 samples_raw.append(raw)
                 sample_topology.append(topology_id)
@@ -372,6 +440,15 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
         "num_active_edges_per_topology": int(topology_active_edge_ids.shape[1]),
         "num_topologies": int(config.num_topologies),
         "samples_per_topology": int(config.samples_per_topology),
+        "dataset_mode": (
+            "strict_voltage_feasible"
+            if config.require_voltage_feasible
+            else "converged_stress"
+        ),
+        "load_scale_bounds": [config.load_low, config.load_high],
+        "voltage_bounds_pu": [config.voltage_min, config.voltage_max],
+        "require_voltage_feasible": config.require_voltage_feasible,
+        "topology_generation_stats": topology_generation_stats,
         "x0_channels": ["p_injection_mw", "q_injection_mvar", "voltage_pu", "theta_rad"],
         "raw_channels": ["p_load_mw", "q_load_mvar", "p_gen_mw", "q_gen_mvar", "voltage_pu", "theta_rad"],
         "edge_channels": ["r_pu", "x_pu", "is_tie", "normally_closed"],
@@ -399,21 +476,49 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
         sample_split=sample_split,
         sample_load_scale=np.stack(sample_scale),
         sample_quality=np.asarray(sample_quality, dtype=np.uint8),
+        sample_attempt_count=sample_attempt_count,
+        sample_rejected_power_flow=sample_rejected_power_flow,
+        sample_rejected_voltage=sample_rejected_voltage,
     )
+    quality = np.asarray(sample_quality, dtype=np.uint8)
+    total_attempts = int(sample_attempt_count.sum())
     print(f"Saved {len(samples_x0):,} samples to {output}")
     print(
         "Topologies by split:",
         {name: int(np.sum(topology_split == code)) for code, name in enumerate(("train", "val", "test"))},
     )
+    print(
+        "Sampling summary:",
+        {
+            "attempts": total_attempts,
+            "accepted": len(samples_x0),
+            "acceptance_rate": round(len(samples_x0) / total_attempts, 6),
+            "rejected_power_flow": int(sample_rejected_power_flow.sum()),
+            "rejected_voltage": int(sample_rejected_voltage.sum()),
+            "saved_voltage_feasible_rate": round(float(quality[:, 3].mean()), 6),
+        },
+    )
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("data/ieee33.npz"))
-    parser.add_argument("--num-topologies", type=int, default=100)
-    parser.add_argument("--samples-per-topology", type=int, default=1000)
-    parser.add_argument("--load-low", type=float, default=0.75)
-    parser.add_argument("--load-high", type=float, default=1.25)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("data/ieee33_feasible_T300_S500_seed2026.npz"),
+    )
+    parser.add_argument("--num-topologies", type=int, default=300)
+    parser.add_argument("--samples-per-topology", type=int, default=500)
+    parser.add_argument("--load-low", type=float, default=0.80)
+    parser.add_argument("--load-high", type=float, default=1.20)
+    parser.add_argument("--voltage-min", type=float, default=0.90)
+    parser.add_argument("--voltage-max", type=float, default=1.10)
+    parser.add_argument(
+        "--allow-voltage-violations",
+        action="store_true",
+        help="Keep converged voltage-violating samples for a stress dataset.",
+    )
+    parser.add_argument("--max-sample-attempt-factor", type=int, default=100)
     parser.add_argument("--train-ratio", type=float, default=0.70)
     parser.add_argument("--val-ratio", type=float, default=0.10)
     parser.add_argument("--seed", type=int, default=2026)
@@ -427,9 +532,13 @@ def main() -> None:
         samples_per_topology=args.samples_per_topology,
         load_low=args.load_low,
         load_high=args.load_high,
+        voltage_min=args.voltage_min,
+        voltage_max=args.voltage_max,
+        require_voltage_feasible=not args.allow_voltage_violations,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
         seed=args.seed,
+        max_sample_attempt_factor=args.max_sample_attempt_factor,
     )
     build_dataset(args.output, config)
 

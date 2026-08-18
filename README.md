@@ -14,7 +14,7 @@
 # 若网络较慢，可先设置：$env:UV_HTTP_TIMEOUT='300'
 uv sync
 
-# 小规模数据集
+# 小规模严格可行数据集（默认要求 0.90 <= V <= 1.10 p.u.）
 uv run ieee33-build --output data/ieee33_smoke.npz --num-topologies 12 --samples-per-topology 20
 
 # 训练
@@ -24,7 +24,57 @@ uv run ieee33-run train --data data/ieee33_smoke.npz --output-dir outputs/smoke 
 uv run ieee33-run sample --data data/ieee33_smoke.npz --checkpoint outputs/smoke/best.pt --output outputs/smoke/generated.npz --num-samples 32
 ```
 
-正式实验可从 100–500 个拓扑、每个拓扑 1000 个运行断面开始。训练、验证和测试按 `topology_id` 划分，同一拓扑不会跨集合泄漏。
+正式主实验默认构建 300 个拓扑、每个拓扑 500 个运行断面，共 150,000 条严格电压可行样本。训练、验证和测试按 `topology_id` 以 70%/10%/20% 划分，同一拓扑不会跨集合泄漏。
+
+```powershell
+# 论文主实验：严格可行数据集，参数均为默认值
+uv run ieee33-build `
+  --output data/ieee33_feasible_T300_S500_seed2026.npz `
+  --num-topologies 300 `
+  --samples-per-topology 500 `
+  --load-low 0.80 `
+  --load-high 1.20 `
+  --voltage-min 0.90 `
+  --voltage-max 1.10 `
+  --seed 2026
+
+# 压力数据集：保留潮流收敛但电压越限的断面
+uv run ieee33-build `
+  --output data/ieee33_stress_T100_S500_seed2026.npz `
+  --num-topologies 100 `
+  --samples-per-topology 500 `
+  --load-low 0.75 `
+  --load-high 1.25 `
+  --allow-voltage-violations `
+  --seed 2026
+```
+
+严格模式是默认模式：拓扑必须在基准负荷下潮流收敛且电压合格；每个运行断面也必须收敛并满足指定电压上下限，否则重新采样。压力模式只要求潮流收敛，电压是否合格记录在 `sample_quality[:,3]` 中。
+
+## Linux 服务器构建
+
+```bash
+git clone ssh://git@ssh.github.com:443/sakura-0025/ieee-topology-diffusion.git
+cd ieee-topology-diffusion
+
+export UV_HTTP_TIMEOUT=300
+uv sync --locked
+mkdir -p data logs
+
+nohup uv run --locked ieee33-build \
+  --output data/ieee33_feasible_T300_S500_seed2026.npz \
+  --num-topologies 300 \
+  --samples-per-topology 500 \
+  --load-low 0.80 \
+  --load-high 1.20 \
+  --voltage-min 0.90 \
+  --voltage-max 1.10 \
+  --seed 2026 \
+  > logs/build_feasible_T300_S500_seed2026.log 2>&1 &
+
+echo $! > logs/build_feasible_T300_S500_seed2026.pid
+tail -f logs/build_feasible_T300_S500_seed2026.log
+```
 
 ## 数据结构
 
@@ -40,5 +90,8 @@ uv run ieee33-run sample --data data/ieee33_smoke.npz --checkpoint outputs/smoke
 - `sample_topology_id [S]`：每个潮流断面所属的拓扑；
 - `sample_load_scale [S, 32]`：每个负荷的随机缩放系数；
 - `sample_quality [S, 4]`：潮流收敛、连通、辐射、电压合格标记。
+- `sample_attempt_count [T]`：每个拓扑获得目标样本数所需的总尝试次数；
+- `sample_rejected_power_flow [T]`：每个拓扑因潮流不收敛被拒绝的数量；
+- `sample_rejected_voltage [T]`：每个拓扑因电压越限被拒绝的数量。
 
 扩散过程只对 `x0` 加噪；拓扑、支路参数和静态节点类型始终作为条件输入。当前版本是可复现的拓扑条件 DDPM 基线，尚未加入潮流方程残差损失或采样引导。
