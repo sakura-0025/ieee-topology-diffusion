@@ -141,7 +141,7 @@ def _physics_metrics(
     master_attr = data["master_edge_attr"]
     active_by_topology = data["topology_active_edge_ids"]
     residual_blocks: list[np.ndarray] = []
-    feasible_blocks: list[np.ndarray] = []
+    sample_max_blocks: list[np.ndarray] = []
     base_mva = dataset_base_mva(data)
     for start in range(0, len(generated), batch_size):
         stop = min(start + batch_size, len(generated))
@@ -156,16 +156,25 @@ def _physics_metrics(
                 base_mva,
             ).abs().cpu().numpy()
         residual_blocks.append(residual.reshape(-1))
-        feasible_blocks.append(np.max(residual, axis=(1, 2)) <= tolerance)
+        sample_max_blocks.append(np.max(residual, axis=(1, 2)))
     residual = np.concatenate(residual_blocks)
-    feasible = np.concatenate(feasible_blocks)
+    sample_max = np.concatenate(sample_max_blocks)
+    tolerances = sorted({tolerance, 1.0e-2, 5.0e-2, 1.0e-1, 5.0e-1, 1.0})
+    feasible_rates = {
+        f"{threshold:g}": float(np.mean(sample_max <= threshold))
+        for threshold in tolerances
+    }
     return {
         "mean_absolute_residual": float(residual.mean()),
         "median_absolute_residual": float(np.median(residual)),
         "p95_absolute_residual": float(np.quantile(residual, 0.95)),
         "p99_absolute_residual": float(np.quantile(residual, 0.99)),
         "maximum_absolute_residual": float(residual.max()),
-        "physics_feasible_rate": float(feasible.mean()),
+        "sample_max_residual_median": float(np.median(sample_max)),
+        "sample_max_residual_p95": float(np.quantile(sample_max, 0.95)),
+        "sample_max_residual_p99": float(np.quantile(sample_max, 0.99)),
+        "physics_feasible_rate": feasible_rates[f"{tolerance:g}"],
+        "physics_feasible_rate_by_tolerance": feasible_rates,
         "physics_tolerance_mw_mvar": tolerance,
     }
 

@@ -251,6 +251,11 @@ def train(args: argparse.Namespace) -> None:
                 batch["topology_mask"].to(device),
             )
             loss = components["total"]
+            if not torch.isfinite(loss):
+                raise FloatingPointError(
+                    "Training loss became NaN or Inf; reduce constraint weights or "
+                    "inspect the diffusion schedule."
+                )
             loss.backward()
             # 限制梯度范数，降低扩散训练初期偶发大梯度造成的不稳定。
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
