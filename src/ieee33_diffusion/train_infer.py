@@ -103,6 +103,35 @@ def _build_model(config: ModelConfig, device: torch.device) -> GaussianDiffusion
     return GaussianDiffusion(denoiser).to(device)
 
 
+def _conditioning_topology_ids(
+    target_ids: np.ndarray,
+    available_ids: np.ndarray,
+    mode: str,
+    seed: int,
+) -> np.ndarray:
+    """构造用于条件消融的拓扑ID，同时保留原目标拓扑用于评价。"""
+
+    if mode == "correct":
+        return target_ids.copy()
+    if mode == "base":
+        return np.zeros_like(target_ids)
+    if mode != "shuffled":
+        raise ValueError(f"Unknown topology condition mode: {mode}")
+    if len(available_ids) < 2:
+        raise ValueError("Shuffled topology conditioning requires at least two topologies.")
+
+    rng = np.random.default_rng(seed + 77)
+    shuffled = available_ids.copy()
+    for _ in range(100):
+        rng.shuffle(shuffled)
+        if np.all(shuffled != available_ids):
+            break
+    else:
+        shuffled = np.roll(available_ids, 1)
+    mapping = {int(target): int(condition) for target, condition in zip(available_ids, shuffled)}
+    return np.asarray([mapping[int(target)] for target in target_ids], dtype=np.int64)
+
+
 def _evaluate(
     model: GaussianDiffusion,
     loader: DataLoader,
@@ -393,6 +422,12 @@ def sample(args: argparse.Namespace) -> None:
         rng.shuffle(selected)
     else:
         selected = rng.choice(selected_topologies, size=args.num_samples, replace=True)
+    conditioning_ids = _conditioning_topology_ids(
+        selected,
+        selected_topologies,
+        args.condition_mode,
+        args.seed,
+    )
     master_index = data["master_edge_index"]
     master_attr = data["master_edge_attr"]
     node_static = torch.from_numpy(data["node_static"].astype(np.float32)).to(device)
@@ -402,8 +437,9 @@ def sample(args: argparse.Namespace) -> None:
     for start in tqdm(range(0, len(selected), args.batch_size), desc="sampling batches"):
         stop = min(start + args.batch_size, len(selected))
         topology_batch = selected[start:stop]
-        active = data["topology_active_edge_ids"][topology_batch]
-        topology_mask = data["topology_edge_mask"][topology_batch]
+        condition_batch = conditioning_ids[start:stop]
+        active = data["topology_active_edge_ids"][condition_batch]
+        topology_mask = data["topology_edge_mask"][condition_batch]
         edge_index = np.stack([master_index[:, ids] for ids in active])
         edge_attr = np.stack([master_attr[ids] for ids in active])
         generated_batch = model.sample(
@@ -427,11 +463,16 @@ def sample(args: argparse.Namespace) -> None:
         args.output,
         generated_x0=generated.astype(np.float32),
         topology_id=selected.astype(np.int32),
+        conditioning_topology_id=conditioning_ids.astype(np.int32),
         active_edge_ids=data["topology_active_edge_ids"][selected].astype(np.int32),
+        conditioning_active_edge_ids=data["topology_active_edge_ids"][conditioning_ids].astype(
+            np.int32
+        ),
         sampling_metadata=np.asarray(
             json.dumps(
                 {
                     "split": args.split,
+                    "condition_mode": args.condition_mode,
                     "batch_size": args.batch_size,
                     "sampling_seconds": sampling_seconds,
                     "seconds_per_sample": sampling_seconds / len(selected),
@@ -525,6 +566,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("validation", "test"),
         default="test",
         help="Topology split to generate; use validation while tuning.",
+    )
+    sample_parser.add_argument(
+        "--condition-mode",
+        choices=("correct", "base", "shuffled"),
+        default="correct",
+        help="Use correct, base-topology, or deranged topology conditioning.",
     )
     sample_parser.add_argument("--batch-size", type=int, default=256)
     sample_parser.add_argument(
