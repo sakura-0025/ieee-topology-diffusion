@@ -95,6 +95,23 @@ echo $! > logs/build_feasible_T300_S500_seed2026.pid
 tail -f logs/build_feasible_T300_S500_seed2026.log
 ```
 
+正式数据已构建后，按论文路线图依次运行阶段脚本：
+
+```bash
+# 阶段1：正式数据审计和物理公式抽查
+bash scripts/server_stage1_audit.sh \
+  data/ieee33_feasible_T300_S500_seed2026.npz \
+  docs/dataset_manifest_T300_S500_seed2026.md \
+  2>&1 | tee logs/stage1_audit.log
+
+# 阶段2：30拓扑开发集上的物理权重预实验
+nohup bash scripts/server_stage2_pilot.sh \
+  data/ieee33_dev_T30_S100_seed2026.npz \
+  > logs/stage2_pilot.log 2>&1 &
+```
+
+阶段2默认比较 `0, 1e-5, 1e-4, 1e-3` 四个物理损失权重。开发实验仅用于选择量级，不能作为最终论文结果。
+
 ## 数据结构
 
 生成的 `.npz` 主要包含：
