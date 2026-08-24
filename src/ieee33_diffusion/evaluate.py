@@ -72,12 +72,10 @@ def _mmd_rbf(
     generated = generated[rng.choice(len(generated), count, replace=False)].reshape(
         count, -1
     )
-    combined = np.concatenate([real, generated], axis=0)
-    # 用最多 500 个点估计中位数带宽，避免构造过大的辅助距离矩阵。
-    bandwidth_count = min(500, len(combined))
-    bandwidth_points = combined[
-        rng.choice(len(combined), bandwidth_count, replace=False)
-    ]
+    # 带宽只由真实参考分布确定。若把病态生成样本混入带宽估计，其尺度爆炸
+    # 会同步放大 RBF 带宽，反而掩盖生成失败，并使不同模型的 MMD 不可比较。
+    bandwidth_count = min(500, len(real))
+    bandwidth_points = real[rng.choice(len(real), bandwidth_count, replace=False)]
     sq_distance = np.sum(
         (bandwidth_points[:, None, :] - bandwidth_points[None, :, :]) ** 2,
         axis=-1,
@@ -99,6 +97,7 @@ def _mmd_rbf(
         "mmd_rbf_squared": max(mmd_sq, 0.0),
         "mmd_sample_count": count,
         "rbf_bandwidth_squared": bandwidth_sq,
+        "rbf_bandwidth_source": "real_reference",
     }
 
 
