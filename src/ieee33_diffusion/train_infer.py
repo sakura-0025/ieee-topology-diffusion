@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 from pathlib import Path
 
 import numpy as np
@@ -241,9 +242,13 @@ def train(args: argparse.Namespace) -> None:
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    training_started = time.perf_counter()
     best_val = float("inf")
     history: list[dict[str, float | int]] = []
     for epoch in range(1, args.epochs + 1):
+        epoch_started = time.perf_counter()
         model.train()
         epoch_losses: dict[str, list[float]] = {
             "total": [],
@@ -301,7 +306,10 @@ def train(args: argparse.Namespace) -> None:
             if np.isfinite(val_metrics["total"])
             else train_metrics["total"]
         )
-        epoch_record: dict[str, float | int] = {"epoch": epoch}
+        epoch_record: dict[str, float | int] = {
+            "epoch": epoch,
+            "epoch_seconds": time.perf_counter() - epoch_started,
+        }
         epoch_record.update({f"train_{k}": v for k, v in train_metrics.items()})
         epoch_record.update({f"val_{k}": v for k, v in val_metrics.items()})
         history.append(epoch_record)
@@ -339,12 +347,23 @@ def train(args: argparse.Namespace) -> None:
     (args.output_dir / "history.json").write_text(
         json.dumps(history, indent=2), encoding="utf-8"
     )
+    training_seconds = time.perf_counter() - training_started
     run_config = {
         "command": "train",
         "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items() if key != "function"},
         "model_config": config.to_dict(),
         "training_loss_config": loss_config.to_dict(),
         "physics_config": checkpoint["physics_config"],
+        "training_summary": {
+            "training_seconds": training_seconds,
+            "seconds_per_epoch": training_seconds / args.epochs,
+            "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
+            "peak_cuda_memory_bytes": (
+                int(torch.cuda.max_memory_allocated(device))
+                if device.type == "cuda"
+                else 0
+            ),
+        },
     }
     (args.output_dir / "config.json").write_text(
         json.dumps(run_config, indent=2), encoding="utf-8"
@@ -364,47 +383,66 @@ def sample(args: argparse.Namespace) -> None:
     model.eval()
 
     data = np.load(args.data, allow_pickle=False)
-    # 只从 topology_split=2 的未见拓扑采样，用于考察跨拓扑泛化能力。
-    test_topologies = np.flatnonzero(data["topology_split"] == 2)
-    if not len(test_topologies):
-        raise ValueError("No unseen test topology is available in the dataset.")
+    split_code = {"validation": 1, "test": 2}[args.split]
+    selected_topologies = np.flatnonzero(data["topology_split"] == split_code)
+    if not len(selected_topologies):
+        raise ValueError(f"No topology is available in the requested {args.split} split.")
     rng = np.random.default_rng(args.seed)
     if args.samples_per_topology is not None:
-        selected = np.repeat(test_topologies, args.samples_per_topology)
+        selected = np.repeat(selected_topologies, args.samples_per_topology)
         rng.shuffle(selected)
     else:
-        selected = rng.choice(test_topologies, size=args.num_samples, replace=True)
-    active = data["topology_active_edge_ids"][selected]
-    topology_mask = data["topology_edge_mask"][selected]
+        selected = rng.choice(selected_topologies, size=args.num_samples, replace=True)
     master_index = data["master_edge_index"]
     master_attr = data["master_edge_attr"]
-    # 为每个待生成样本组装 [2,32] 活动边和对应的 [32,4] 线路特征。
-    edge_index = np.stack([master_index[:, ids] for ids in active])
-    edge_attr = np.stack([master_attr[ids] for ids in active])
     node_static = torch.from_numpy(data["node_static"].astype(np.float32)).to(device)
 
-    # 模型输出仍处于训练时的标准化空间，形状为 [S,33,4]。
-    generated_normalized = model.sample(
-        (len(selected), int(data["node_static"].shape[0]), config.node_channels),
-        node_static,
-        torch.from_numpy(edge_index).long().to(device),
-        torch.from_numpy(edge_attr).float().to(device),
-        device,
-        torch.from_numpy(topology_mask).float().to(device),
-    )
+    generated_blocks: list[np.ndarray] = []
+    sampling_started = time.perf_counter()
+    for start in tqdm(range(0, len(selected), args.batch_size), desc="sampling batches"):
+        stop = min(start + args.batch_size, len(selected))
+        topology_batch = selected[start:stop]
+        active = data["topology_active_edge_ids"][topology_batch]
+        topology_mask = data["topology_edge_mask"][topology_batch]
+        edge_index = np.stack([master_index[:, ids] for ids in active])
+        edge_attr = np.stack([master_attr[ids] for ids in active])
+        generated_batch = model.sample(
+            (len(topology_batch), int(data["node_static"].shape[0]), config.node_channels),
+            node_static,
+            torch.from_numpy(edge_index).long().to(device),
+            torch.from_numpy(edge_attr).float().to(device),
+            device,
+            torch.from_numpy(topology_mask).float().to(device),
+        )
+        generated_blocks.append(generated_batch.cpu().numpy())
+    generated_normalized = np.concatenate(generated_blocks, axis=0)
+    sampling_seconds = time.perf_counter() - sampling_started
     mean = np.asarray(checkpoint["normalization_mean"], dtype=np.float32)
     std = np.asarray(checkpoint["normalization_std"], dtype=np.float32)
     # 反标准化后恢复 MW、Mvar、p.u. 和 rad 的物理量尺度。
-    generated = generated_normalized.cpu().numpy() * std + mean
+    generated = generated_normalized * std + mean
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         args.output,
         generated_x0=generated.astype(np.float32),
         topology_id=selected.astype(np.int32),
-        active_edge_ids=active.astype(np.int32),
+        active_edge_ids=data["topology_active_edge_ids"][selected].astype(np.int32),
+        sampling_metadata=np.asarray(
+            json.dumps(
+                {
+                    "split": args.split,
+                    "batch_size": args.batch_size,
+                    "sampling_seconds": sampling_seconds,
+                    "seconds_per_sample": sampling_seconds / len(selected),
+                }
+            )
+        ),
     )
-    print(f"Saved {len(selected)} generated samples to {args.output}")
+    print(
+        f"Saved {len(selected)} generated samples to {args.output} in "
+        f"{sampling_seconds:.3f} seconds"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -475,11 +513,20 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--seed", type=int, default=2026)
     train_parser.set_defaults(function=train)
 
-    sample_parser = subparsers.add_parser("sample", help="Sample unseen test topologies")
+    sample_parser = subparsers.add_parser(
+        "sample", help="Sample validation or unseen test topologies"
+    )
     sample_parser.add_argument("--data", type=Path, required=True)
     sample_parser.add_argument("--checkpoint", type=Path, required=True)
     sample_parser.add_argument("--output", type=Path, default=Path("outputs/generated.npz"))
     sample_parser.add_argument("--num-samples", type=int, default=64)
+    sample_parser.add_argument(
+        "--split",
+        choices=("validation", "test"),
+        default="test",
+        help="Topology split to generate; use validation while tuning.",
+    )
+    sample_parser.add_argument("--batch-size", type=int, default=256)
     sample_parser.add_argument(
         "--samples-per-topology",
         type=int,

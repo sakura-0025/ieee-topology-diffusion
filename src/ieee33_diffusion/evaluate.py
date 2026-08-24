@@ -142,6 +142,7 @@ def _physics_metrics(
     active_by_topology = data["topology_active_edge_ids"]
     residual_blocks: list[np.ndarray] = []
     sample_max_blocks: list[np.ndarray] = []
+    sample_mean_blocks: list[np.ndarray] = []
     base_mva = dataset_base_mva(data)
     for start in range(0, len(generated), batch_size):
         stop = min(start + batch_size, len(generated))
@@ -157,11 +158,19 @@ def _physics_metrics(
             ).abs().cpu().numpy()
         residual_blocks.append(residual.reshape(-1))
         sample_max_blocks.append(np.max(residual, axis=(1, 2)))
+        sample_mean_blocks.append(np.mean(residual, axis=(1, 2)))
     residual = np.concatenate(residual_blocks)
     sample_max = np.concatenate(sample_max_blocks)
-    tolerances = sorted({tolerance, 1.0e-2, 5.0e-2, 1.0e-1, 5.0e-1, 1.0})
+    sample_mean = np.concatenate(sample_mean_blocks)
+    tolerances = sorted(
+        {tolerance, 1.0e-2, 5.0e-2, 1.0e-1, 5.0e-1, 1.0, 2.0, 5.0, 10.0}
+    )
     feasible_rates = {
         f"{threshold:g}": float(np.mean(sample_max <= threshold))
+        for threshold in tolerances
+    }
+    mean_residual_rates = {
+        f"{threshold:g}": float(np.mean(sample_mean <= threshold))
         for threshold in tolerances
     }
     return {
@@ -173,8 +182,12 @@ def _physics_metrics(
         "sample_max_residual_median": float(np.median(sample_max)),
         "sample_max_residual_p95": float(np.quantile(sample_max, 0.95)),
         "sample_max_residual_p99": float(np.quantile(sample_max, 0.99)),
+        "sample_mean_residual_median": float(np.median(sample_mean)),
+        "sample_mean_residual_p95": float(np.quantile(sample_mean, 0.95)),
+        "sample_mean_residual_p99": float(np.quantile(sample_mean, 0.99)),
         "physics_feasible_rate": feasible_rates[f"{tolerance:g}"],
         "physics_feasible_rate_by_tolerance": feasible_rates,
+        "sample_mean_residual_rate_by_tolerance": mean_residual_rates,
         "physics_tolerance_mw_mvar": tolerance,
     }
 
@@ -274,12 +287,27 @@ def evaluate(
             )
             mask = data["topology_edge_mask"][topology_id].astype(bool)
             switch_distance = int(np.count_nonzero(mask != base_mask) // 2)
+            topology_physics = _physics_metrics(
+                data,
+                generated[positions],
+                topology_ids[positions],
+                batch_size,
+                physics_tolerance,
+            )
+            topology_voltage = generated[positions, :, 2]
+            topology_voltage_violation = np.any(
+                (topology_voltage < voltage_bounds[0])
+                | (topology_voltage > voltage_bounds[1]),
+                axis=1,
+            )
             per_topology.append(
                 {
                     "topology_id": int(topology_id),
                     "topology_split": int(data["topology_split"][topology_id]),
                     "switch_distance_from_base": switch_distance,
                     "generated_sample_count": len(positions),
+                    "physics": topology_physics,
+                    "voltage_violation_rate": float(topology_voltage_violation.mean()),
                     **topology_distribution,
                 }
             )
@@ -289,6 +317,9 @@ def evaluate(
             "generated_path": str(generated_path.resolve()),
             "generated_sample_count": len(generated),
             "unique_generated_topologies": int(len(np.unique(topology_ids))),
+            "generated_topology_split_codes": sorted(
+                {int(data["topology_split"][topology_id]) for topology_id in np.unique(topology_ids)}
+            ),
             "distribution": distribution,
             "physics": physics,
             "voltage_violation_rate": float(voltage_violation.mean()),
