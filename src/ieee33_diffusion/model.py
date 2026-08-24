@@ -30,6 +30,7 @@ class ModelConfig:
     time_channels: int = 128
     num_layers: int = 6
     diffusion_steps: int = 200
+    noise_schedule: str = "linear"
     beta_start: float = 1.0e-4
     beta_end: float = 2.0e-2
     model_type: str = "graph"
@@ -39,8 +40,14 @@ class ModelConfig:
     def __post_init__(self) -> None:
         if self.model_type not in {"graph", "vector"}:
             raise ValueError("model_type must be 'graph' or 'vector'.")
+        if self.noise_schedule not in {"linear", "cosine"}:
+            raise ValueError("noise_schedule must be 'linear' or 'cosine'.")
+        if self.diffusion_steps < 2:
+            raise ValueError("diffusion_steps must be at least 2.")
+        if not 0.0 < self.beta_start < self.beta_end < 1.0:
+            raise ValueError("Require 0 < beta_start < beta_end < 1.")
 
-    def to_dict(self) -> dict[str, int | float]:
+    def to_dict(self) -> dict[str, int | float | str]:
         return asdict(self)
 
 
@@ -315,7 +322,23 @@ class GaussianDiffusion(nn.Module):
         self.denoiser = denoiser
         config = denoiser.config
         # alpha_t = 1-beta_t；alpha_bar_t 是从第 0 步到第 t 步的累计乘积。
-        betas = torch.linspace(config.beta_start, config.beta_end, config.diffusion_steps)
+        # 线性日程保留用于复现实验；余弦日程在 100/200 等少步数设置下仍能让
+        # q(x_T|x_0) 充分接近标准高斯，避免训练末态与采样起点不匹配。
+        if config.noise_schedule == "linear":
+            betas = torch.linspace(
+                config.beta_start, config.beta_end, config.diffusion_steps
+            )
+        else:
+            offset = 0.008
+            time = torch.linspace(0, config.diffusion_steps, config.diffusion_steps + 1)
+            cumulative = torch.cos(
+                ((time / config.diffusion_steps + offset) / (1.0 + offset))
+                * math.pi
+                / 2.0
+            ).square()
+            cumulative = cumulative / cumulative[0]
+            betas = 1.0 - cumulative[1:] / cumulative[:-1]
+            betas = betas.clamp(min=1.0e-8, max=0.999)
         alphas = 1.0 - betas
         alpha_bars = torch.cumprod(alphas, dim=0)
         previous_alpha_bars = torch.cat(

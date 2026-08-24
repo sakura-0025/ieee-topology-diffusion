@@ -142,6 +142,41 @@ def _evaluate(
     }
 
 
+def _evaluate_with_fixed_noise(
+    model: GaussianDiffusion,
+    loader: DataLoader,
+    node_static: torch.Tensor,
+    normalization_mean: torch.Tensor,
+    normalization_std: torch.Tensor,
+    loss_config: TrainingLossConfig,
+    physics_config: PhysicsConfig,
+    device: torch.device,
+    seed: int,
+) -> dict[str, float]:
+    """使用固定验证噪声评价，并在结束后恢复训练随机数状态。"""
+
+    cpu_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    try:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        return _evaluate(
+            model,
+            loader,
+            node_static,
+            normalization_mean,
+            normalization_std,
+            loss_config,
+            physics_config,
+            device,
+        )
+    finally:
+        torch.random.set_rng_state(cpu_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
+
+
 def train(args: argparse.Namespace) -> None:
     """训练模型并保存 last/best 检查点及损失历史。"""
 
@@ -164,6 +199,7 @@ def train(args: argparse.Namespace) -> None:
         hidden_channels=args.hidden_channels,
         num_layers=args.num_layers,
         diffusion_steps=args.diffusion_steps,
+        noise_schedule=args.noise_schedule,
         model_type=args.model_type,
     )
     model = _build_model(config, device)
@@ -229,7 +265,7 @@ def train(args: argparse.Namespace) -> None:
         train_metrics = {
             name: float(np.mean(values)) for name, values in epoch_losses.items()
         }
-        val_metrics = _evaluate(
+        val_metrics = _evaluate_with_fixed_noise(
             model,
             val_loader,
             node_static,
@@ -238,6 +274,7 @@ def train(args: argparse.Namespace) -> None:
             loss_config,
             physics_config,
             device,
+            args.seed + 100_000,
         )
         metric = (
             val_metrics["total"]
@@ -365,6 +402,12 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--hidden-channels", type=int, default=128)
     train_parser.add_argument("--num-layers", type=int, default=6)
     train_parser.add_argument("--diffusion-steps", type=int, default=200)
+    train_parser.add_argument(
+        "--noise-schedule",
+        choices=("linear", "cosine"),
+        default="linear",
+        help="Forward diffusion noise schedule; cosine is suitable for fewer steps.",
+    )
     train_parser.add_argument(
         "--model-type",
         choices=("graph", "vector"),
