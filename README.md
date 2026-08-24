@@ -6,7 +6,9 @@
 
 - `src/ieee33_diffusion/build_dataset.py`：使用支路交换生成辐射拓扑，施加负荷扰动并计算 AC 潮流。
 - `src/ieee33_diffusion/model.py`：拓扑条件图去噪器和 DDPM 正、反向过程。
+- `src/ieee33_diffusion/physics.py`：按活动拓扑构造导纳矩阵并计算可微交流潮流残差。
 - `src/ieee33_diffusion/train_infer.py`：训练、验证，以及在未见测试拓扑上的反向采样。
+- `src/ieee33_diffusion/audit_dataset.py`：检查数据结构、拓扑划分和物理一致性，生成论文数据清单。
 
 ## 快速开始
 
@@ -20,8 +22,25 @@ uv run ieee33-build --output data/ieee33_smoke.npz --num-topologies 12 --samples
 # 训练
 uv run ieee33-run train --data data/ieee33_smoke.npz --output-dir outputs/smoke --epochs 20
 
+# 物理引导图扩散训练（权重需通过验证集选择）
+uv run ieee33-run train --data data/ieee33_smoke.npz --output-dir outputs/physics_smoke `
+  --epochs 20 --physics-weight 1e-4 --voltage-weight 1.0 --physics-time-weight alpha_bar
+
+# 展平状态与37位拓扑掩码的 Vector-DDPM 对照组
+uv run ieee33-run train --data data/ieee33_smoke.npz --output-dir outputs/vector_smoke `
+  --model-type vector --epochs 20
+
+# 生成数据审计清单
+uv run ieee33-audit --data data/ieee33_smoke.npz --output docs/dataset_manifest.md
+
 # 在测试集未见拓扑上生成样本
 uv run ieee33-run sample --data data/ieee33_smoke.npz --checkpoint outputs/smoke/best.pt --output outputs/smoke/generated.npz --num-samples 32
+
+# 每个未见测试拓扑生成相同数量的样本并统一评价
+uv run ieee33-run sample --data data/ieee33_smoke.npz --checkpoint outputs/smoke/best.pt `
+  --output outputs/smoke/generated_equal.npz --samples-per-topology 100
+uv run ieee33-evaluate --data data/ieee33_smoke.npz `
+  --generated outputs/smoke/generated_equal.npz --output outputs/smoke/metrics.json
 ```
 
 正式主实验默认构建 300 个拓扑、每个拓扑 500 个运行断面，共 150,000 条严格电压可行样本。训练、验证和测试按 `topology_id` 以 70%/10%/20% 划分，同一拓扑不会跨集合泄漏。

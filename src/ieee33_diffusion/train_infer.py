@@ -12,7 +12,14 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
-from .model import GaussianDiffusion, ModelConfig, TopologyConditionedDenoiser
+from .model import (
+    GaussianDiffusion,
+    ModelConfig,
+    TopologyConditionedDenoiser,
+    TrainingLossConfig,
+    VectorConditionedDenoiser,
+)
+from .physics import PhysicsConfig, dataset_base_mva
 
 
 class IEEE33Dataset(Dataset):
@@ -25,6 +32,7 @@ class IEEE33Dataset(Dataset):
         self.x0 = data["x0"][indices].astype(np.float32)
         self.topology_ids = data["sample_topology_id"][indices].astype(np.int64)
         self.active_edge_ids = data["topology_active_edge_ids"].astype(np.int64)
+        self.topology_edge_mask = data["topology_edge_mask"].astype(np.float32)
         self.master_edge_index = data["master_edge_index"].astype(np.int64)
         self.master_edge_attr = data["master_edge_attr"].astype(np.float32)
         self.node_static = data["node_static"].astype(np.float32)
@@ -44,6 +52,7 @@ class IEEE33Dataset(Dataset):
             "x0": torch.from_numpy(x),
             "edge_index": torch.from_numpy(self.master_edge_index[:, edge_ids]),
             "edge_attr": torch.from_numpy(self.master_edge_attr[edge_ids]),
+            "topology_mask": torch.from_numpy(self.topology_edge_mask[topology_id]),
             "topology_id": torch.tensor(topology_id, dtype=torch.long),
         }
 
@@ -82,29 +91,55 @@ def _seed_everything(seed: int) -> None:
 
 
 def _build_model(config: ModelConfig, device: torch.device) -> GaussianDiffusion:
-    """构造图去噪器，并封装为完整扩散模型。"""
+    """按配置构造图或向量去噪器，并封装为完整扩散模型。"""
 
-    denoiser = TopologyConditionedDenoiser(config)
+    if config.model_type == "graph":
+        denoiser = TopologyConditionedDenoiser(config)
+    elif config.model_type == "vector":
+        denoiser = VectorConditionedDenoiser(config)
+    else:
+        raise ValueError(f"Unknown model_type: {config.model_type}")
     return GaussianDiffusion(denoiser).to(device)
 
 
 def _evaluate(
-    model: GaussianDiffusion, loader: DataLoader, node_static: torch.Tensor, device: torch.device
-) -> float:
-    """计算验证集的平均噪声预测损失，不更新模型参数。"""
+    model: GaussianDiffusion,
+    loader: DataLoader,
+    node_static: torch.Tensor,
+    normalization_mean: torch.Tensor,
+    normalization_std: torch.Tensor,
+    loss_config: TrainingLossConfig,
+    physics_config: PhysicsConfig,
+    device: torch.device,
+) -> dict[str, float]:
+    """计算验证集各项平均损失，不更新模型参数。"""
 
     model.eval()
-    losses: list[float] = []
+    losses: dict[str, list[float]] = {
+        "total": [],
+        "noise": [],
+        "physics": [],
+        "voltage": [],
+    }
     with torch.no_grad():
         for batch in loader:
-            loss = model.training_loss(
+            components = model.training_losses(
                 batch["x0"].to(device),
                 node_static,
                 batch["edge_index"].to(device),
                 batch["edge_attr"].to(device),
+                normalization_mean,
+                normalization_std,
+                loss_config,
+                physics_config,
+                batch["topology_mask"].to(device),
             )
-            losses.append(float(loss))
-    return float(np.mean(losses)) if losses else float("nan")
+            for name, value in components.items():
+                losses[name].append(float(value))
+    return {
+        name: float(np.mean(values)) if values else float("nan")
+        for name, values in losses.items()
+    }
 
 
 def train(args: argparse.Namespace) -> None:
@@ -129,48 +164,115 @@ def train(args: argparse.Namespace) -> None:
         hidden_channels=args.hidden_channels,
         num_layers=args.num_layers,
         diffusion_steps=args.diffusion_steps,
+        model_type=args.model_type,
     )
     model = _build_model(config, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     # 节点类型在所有运行断面间不变，因此只需保留一份 [33,4] 条件张量。
     node_static = torch.from_numpy(train_set.node_static).to(device)
+    normalization_mean = torch.from_numpy(mean).to(device)
+    normalization_std = torch.from_numpy(std).to(device)
+    with np.load(args.data, allow_pickle=False) as data:
+        metadata = json.loads(str(data["metadata"].item()))
+        voltage_bounds = metadata.get("voltage_bounds_pu", [0.90, 1.10])
+        physics_config = PhysicsConfig(
+            base_mva=dataset_base_mva(data),
+            voltage_min_pu=float(voltage_bounds[0]),
+            voltage_max_pu=float(voltage_bounds[1]),
+            residual_scale_mw=args.pf_scale_mw,
+            residual_scale_mvar=args.pf_scale_mvar,
+            include_slack=not args.exclude_slack_physics,
+        )
+    loss_config = TrainingLossConfig(
+        physics_weight=args.physics_weight,
+        voltage_weight=args.voltage_weight,
+        physics_time_weight=args.physics_time_weight,
+    )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     best_val = float("inf")
     history: list[dict[str, float | int]] = []
     for epoch in range(1, args.epochs + 1):
         model.train()
-        epoch_losses: list[float] = []
+        epoch_losses: dict[str, list[float]] = {
+            "total": [],
+            "noise": [],
+            "physics": [],
+            "voltage": [],
+        }
         progress = tqdm(train_loader, desc=f"epoch {epoch}/{args.epochs}")
         for batch in progress:
             optimizer.zero_grad(set_to_none=True)
-            loss = model.training_loss(
+            components = model.training_losses(
                 batch["x0"].to(device),
                 node_static,
                 batch["edge_index"].to(device),
                 batch["edge_attr"].to(device),
+                normalization_mean,
+                normalization_std,
+                loss_config,
+                physics_config,
+                batch["topology_mask"].to(device),
             )
+            loss = components["total"]
             loss.backward()
             # 限制梯度范数，降低扩散训练初期偶发大梯度造成的不稳定。
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            epoch_losses.append(float(loss.detach()))
-            progress.set_postfix(loss=f"{epoch_losses[-1]:.4f}")
+            for name, value in components.items():
+                epoch_losses[name].append(float(value.detach()))
+            progress.set_postfix(
+                total=f"{epoch_losses['total'][-1]:.4f}",
+                pf=f"{epoch_losses['physics'][-1]:.4f}",
+            )
 
-        train_loss = float(np.mean(epoch_losses))
-        val_loss = _evaluate(model, val_loader, node_static, device)
-        metric = val_loss if np.isfinite(val_loss) else train_loss
-        history.append({"epoch": epoch, "train_loss": train_loss, "val_loss": val_loss})
-        print(f"epoch={epoch} train={train_loss:.6f} val={val_loss:.6f}")
+        train_metrics = {
+            name: float(np.mean(values)) for name, values in epoch_losses.items()
+        }
+        val_metrics = _evaluate(
+            model,
+            val_loader,
+            node_static,
+            normalization_mean,
+            normalization_std,
+            loss_config,
+            physics_config,
+            device,
+        )
+        metric = (
+            val_metrics["total"]
+            if np.isfinite(val_metrics["total"])
+            else train_metrics["total"]
+        )
+        epoch_record: dict[str, float | int] = {"epoch": epoch}
+        epoch_record.update({f"train_{k}": v for k, v in train_metrics.items()})
+        epoch_record.update({f"val_{k}": v for k, v in val_metrics.items()})
+        history.append(epoch_record)
+        print(
+            f"epoch={epoch} train_total={train_metrics['total']:.6f} "
+            f"train_noise={train_metrics['noise']:.6f} "
+            f"train_pf={train_metrics['physics']:.6f} "
+            f"val_total={val_metrics['total']:.6f} "
+            f"val_pf={val_metrics['physics']:.6f}"
+        )
 
         # 检查点同时保存配置与归一化统计量，推理时无需重新估计训练集统计。
         checkpoint = {
             "model": model.state_dict(),
             "model_config": config.to_dict(),
+            "training_loss_config": loss_config.to_dict(),
+            "physics_config": {
+                "base_mva": physics_config.base_mva,
+                "voltage_min_pu": physics_config.voltage_min_pu,
+                "voltage_max_pu": physics_config.voltage_max_pu,
+                "residual_scale_mw": physics_config.residual_scale_mw,
+                "residual_scale_mvar": physics_config.residual_scale_mvar,
+                "include_slack": physics_config.include_slack,
+            },
             "normalization_mean": mean,
             "normalization_std": std,
             "epoch": epoch,
-            "validation_loss": val_loss,
+            "validation_loss": val_metrics["total"],
         }
         torch.save(checkpoint, args.output_dir / "last.pt")
         if metric < best_val:
@@ -179,6 +281,16 @@ def train(args: argparse.Namespace) -> None:
 
     (args.output_dir / "history.json").write_text(
         json.dumps(history, indent=2), encoding="utf-8"
+    )
+    run_config = {
+        "command": "train",
+        "arguments": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items() if key != "function"},
+        "model_config": config.to_dict(),
+        "training_loss_config": loss_config.to_dict(),
+        "physics_config": checkpoint["physics_config"],
+    }
+    (args.output_dir / "config.json").write_text(
+        json.dumps(run_config, indent=2), encoding="utf-8"
     )
     print(f"Best checkpoint: {args.output_dir / 'best.pt'}")
 
@@ -200,8 +312,13 @@ def sample(args: argparse.Namespace) -> None:
     if not len(test_topologies):
         raise ValueError("No unseen test topology is available in the dataset.")
     rng = np.random.default_rng(args.seed)
-    selected = rng.choice(test_topologies, size=args.num_samples, replace=True)
+    if args.samples_per_topology is not None:
+        selected = np.repeat(test_topologies, args.samples_per_topology)
+        rng.shuffle(selected)
+    else:
+        selected = rng.choice(test_topologies, size=args.num_samples, replace=True)
     active = data["topology_active_edge_ids"][selected]
+    topology_mask = data["topology_edge_mask"][selected]
     master_index = data["master_edge_index"]
     master_attr = data["master_edge_attr"]
     # 为每个待生成样本组装 [2,32] 活动边和对应的 [32,4] 线路特征。
@@ -211,11 +328,12 @@ def sample(args: argparse.Namespace) -> None:
 
     # 模型输出仍处于训练时的标准化空间，形状为 [S,33,4]。
     generated_normalized = model.sample(
-        (args.num_samples, int(data["node_static"].shape[0]), config.node_channels),
+        (len(selected), int(data["node_static"].shape[0]), config.node_channels),
         node_static,
         torch.from_numpy(edge_index).long().to(device),
         torch.from_numpy(edge_attr).float().to(device),
         device,
+        torch.from_numpy(topology_mask).float().to(device),
     )
     mean = np.asarray(checkpoint["normalization_mean"], dtype=np.float32)
     std = np.asarray(checkpoint["normalization_std"], dtype=np.float32)
@@ -229,7 +347,7 @@ def sample(args: argparse.Namespace) -> None:
         topology_id=selected.astype(np.int32),
         active_edge_ids=active.astype(np.int32),
     )
-    print(f"Saved {args.num_samples} generated samples to {args.output}")
+    print(f"Saved {len(selected)} generated samples to {args.output}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -247,6 +365,37 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--hidden-channels", type=int, default=128)
     train_parser.add_argument("--num-layers", type=int, default=6)
     train_parser.add_argument("--diffusion-steps", type=int, default=200)
+    train_parser.add_argument(
+        "--model-type",
+        choices=("graph", "vector"),
+        default="graph",
+        help="Use graph message passing or a flattened topology-conditioned baseline.",
+    )
+    train_parser.add_argument(
+        "--physics-weight",
+        type=float,
+        default=0.0,
+        help="Weight of topology-specific AC power-flow residual loss.",
+    )
+    train_parser.add_argument(
+        "--voltage-weight",
+        type=float,
+        default=0.0,
+        help="Weight of voltage-limit violation loss.",
+    )
+    train_parser.add_argument(
+        "--physics-time-weight",
+        choices=("none", "alpha_bar"),
+        default="alpha_bar",
+        help="Down-weight unreliable physics gradients at noisy diffusion steps.",
+    )
+    train_parser.add_argument("--pf-scale-mw", type=float, default=1.0)
+    train_parser.add_argument("--pf-scale-mvar", type=float, default=1.0)
+    train_parser.add_argument(
+        "--exclude-slack-physics",
+        action="store_true",
+        help="Exclude the slack bus from AC residual loss.",
+    )
     train_parser.add_argument("--device", default="auto")
     train_parser.add_argument("--seed", type=int, default=2026)
     train_parser.set_defaults(function=train)
@@ -256,6 +405,12 @@ def build_parser() -> argparse.ArgumentParser:
     sample_parser.add_argument("--checkpoint", type=Path, required=True)
     sample_parser.add_argument("--output", type=Path, default=Path("outputs/generated.npz"))
     sample_parser.add_argument("--num-samples", type=int, default=64)
+    sample_parser.add_argument(
+        "--samples-per-topology",
+        type=int,
+        default=None,
+        help="Generate an equal number for every unseen test topology.",
+    )
     sample_parser.add_argument("--device", default="auto")
     sample_parser.add_argument("--seed", type=int, default=2026)
     sample_parser.set_defaults(function=sample)

@@ -435,6 +435,7 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
     sample_split = topology_split[sample_topology_array]
     metadata = {
         "case": "Baran-Wu case33bw",
+        "base_mva": float(net.sn_mva),
         "num_nodes": int(len(net.bus)),
         "num_candidate_edges": int(len(net.line)),
         "num_active_edges_per_topology": int(topology_active_edge_ids.shape[1]),
@@ -462,6 +463,7 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
     np.savez_compressed(
         output,
         metadata=np.asarray(json.dumps(metadata, ensure_ascii=False)),
+        base_mva=np.asarray(float(net.sn_mva), dtype=np.float32),
         node_static=_node_static(net),
         master_edge_index=master_edge_index.astype(np.int32),
         master_edge_attr=master_edge_attr,

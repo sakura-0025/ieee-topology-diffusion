@@ -8,6 +8,7 @@ dependencies = [
     "networkx>=3.4",
     "numpy>=2.0",
     "pandapower>=3.1",
+    "scipy>=1.14",
     "torch>=2.5",
     "tqdm>=4.67",
 ]
@@ -15,6 +16,8 @@ dependencies = [
 [project.scripts]
 ieee33-build = "ieee33_diffusion.build_dataset:main"
 ieee33-run = "ieee33_diffusion.train_infer:main"
+ieee33-audit = "ieee33_diffusion.audit_dataset:main"
+ieee33-evaluate = "ieee33_diffusion.evaluate:main"
 
 [build-system]
 requires = ["setuptools>=75"]
