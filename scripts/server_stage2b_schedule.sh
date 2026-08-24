@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 阶段2B：验证少步数余弦日程能否修复生成分布，不启用任何物理约束。
+# 阶段2B：校准扩散日程是否能稳定生成分布，不启用任何物理约束。
 
 set -euo pipefail
 
@@ -7,8 +7,11 @@ dev_data="${1:-data/ieee33_dev_T30_S100_seed2026.npz}"
 epochs="${SCHEDULE_EPOCHS:-100}"
 batch_size="${SCHEDULE_BATCH_SIZE:-64}"
 device="${SCHEDULE_DEVICE:-auto}"
-experiment_id="pilot_schedule_cosine_T100_E${epochs}_seed2026"
+schedule_type="${SCHEDULE_TYPE:-cosine}"
+diffusion_steps="${SCHEDULE_STEPS:-100}"
+experiment_id="pilot_schedule_${schedule_type}_T${diffusion_steps}_E${epochs}_seed2026"
 output_dir="outputs/${experiment_id}"
+summary_path="docs/pilot_schedule_${schedule_type}_T${diffusion_steps}_summary.json"
 
 mkdir -p docs logs outputs
 
@@ -33,8 +36,8 @@ uv run --locked ieee33-run train \
   --learning-rate 2e-4 \
   --hidden-channels 64 \
   --num-layers 4 \
-  --diffusion-steps 100 \
-  --noise-schedule cosine \
+  --diffusion-steps "${diffusion_steps}" \
+  --noise-schedule "${schedule_type}" \
   --physics-weight 0 \
   --voltage-weight 0 \
   --device "${device}" \
@@ -93,10 +96,8 @@ for checkpoint_name in ("best", "last"):
         "physics_feasible_rate_at_1e-2": metrics["physics"]["physics_feasible_rate"],
         "voltage_violation_rate": metrics["voltage_violation_rate"],
     }
-(Path("docs") / "pilot_schedule_summary.json").write_text(
-    json.dumps(summary, indent=2), encoding="utf-8"
-)
-print("Schedule summary written to: docs/pilot_schedule_summary.json")
+Path("${summary_path}").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+print("Schedule summary written to: ${summary_path}")
 PY
 
-echo "Stage 2B complete. Return docs/pilot_schedule_summary.json."
+echo "Stage 2B complete. Return ${summary_path}."
