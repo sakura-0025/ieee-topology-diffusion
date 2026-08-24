@@ -58,12 +58,15 @@ class TrainingLossConfig:
     physics_weight: float = 0.0
     voltage_weight: float = 0.0
     physics_time_weight: str = "alpha_bar"
+    physics_alpha_bar_min: float = 0.0
 
     def __post_init__(self) -> None:
         if self.physics_weight < 0.0 or self.voltage_weight < 0.0:
             raise ValueError("Loss weights must be non-negative.")
         if self.physics_time_weight not in {"none", "alpha_bar"}:
             raise ValueError("physics_time_weight must be 'none' or 'alpha_bar'.")
+        if not 0.0 <= self.physics_alpha_bar_min < 1.0:
+            raise ValueError("physics_alpha_bar_min must lie in [0, 1).")
 
     def to_dict(self) -> dict[str, float | str]:
         return asdict(self)
@@ -433,30 +436,39 @@ class GaussianDiffusion(nn.Module):
                 time_weight = torch.ones(batch, device=clean_x.device)
 
             if loss_config.physics_weight > 0.0:
-                residual = ac_power_flow_residual(
-                    physical_state,
-                    edge_index,
-                    edge_attr,
-                    physics_config.base_mva,
+                # 高噪声时刻由 x_t 恢复 x0 会放大噪声预测误差，再经过非线性
+                # AC 方程和平方损失后可能产生破坏性梯度。只对清洁状态估计
+                # 足够可信的样本计算物理项，并在切片后再构造残差。
+                eligible = (
+                    self.alpha_bars.gather(0, timestep)
+                    >= loss_config.physics_alpha_bar_min
                 )
-                scale = residual.new_tensor(
-                    [
-                        physics_config.residual_scale_mw,
-                        physics_config.residual_scale_mvar,
-                    ]
-                )
-                per_node = (residual / scale).square().mean(dim=-1)
-                if physics_config.include_slack:
-                    per_sample = per_node.mean(dim=-1)
-                else:
-                    static = node_static
-                    if static.ndim == 2:
-                        static = static.unsqueeze(0).expand(batch, -1, -1)
-                    non_slack = 1.0 - static[..., 1]
-                    per_sample = (per_node * non_slack).sum(dim=-1) / non_slack.sum(
-                        dim=-1
-                    ).clamp_min(1.0)
-                physics_loss = (time_weight * per_sample).mean()
+                if bool(eligible.any()):
+                    residual = ac_power_flow_residual(
+                        physical_state[eligible],
+                        edge_index[eligible],
+                        edge_attr[eligible],
+                        physics_config.base_mva,
+                    )
+                    scale = residual.new_tensor(
+                        [
+                            physics_config.residual_scale_mw,
+                            physics_config.residual_scale_mvar,
+                        ]
+                    )
+                    per_node = (residual / scale).square().mean(dim=-1)
+                    if physics_config.include_slack:
+                        per_sample = per_node.mean(dim=-1)
+                    else:
+                        static = node_static
+                        if static.ndim == 2:
+                            static = static.unsqueeze(0).expand(batch, -1, -1)
+                        static = static[eligible]
+                        non_slack = 1.0 - static[..., 1]
+                        per_sample = (per_node * non_slack).sum(dim=-1) / non_slack.sum(
+                            dim=-1
+                        ).clamp_min(1.0)
+                    physics_loss = (time_weight[eligible] * per_sample).mean()
 
             if loss_config.voltage_weight > 0.0:
                 voltage = physical_state[..., 2]

@@ -203,6 +203,20 @@ def train(args: argparse.Namespace) -> None:
         model_type=args.model_type,
     )
     model = _build_model(config, device)
+    if args.init_checkpoint is not None:
+        initial = torch.load(args.init_checkpoint, map_location=device, weights_only=False)
+        initial_config = ModelConfig(**initial["model_config"])
+        if initial_config != config:
+            raise ValueError(
+                "Initial checkpoint model configuration does not match training arguments."
+            )
+        if not (
+            np.allclose(initial["normalization_mean"], mean)
+            and np.allclose(initial["normalization_std"], std)
+        ):
+            raise ValueError("Initial checkpoint normalization does not match dataset.")
+        model.load_state_dict(initial["model"])
+        print(f"Initialized model from: {args.init_checkpoint}")
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
     # 节点类型在所有运行断面间不变，因此只需保留一份 [33,4] 条件张量。
     node_static = torch.from_numpy(train_set.node_static).to(device)
@@ -223,6 +237,7 @@ def train(args: argparse.Namespace) -> None:
         physics_weight=args.physics_weight,
         voltage_weight=args.voltage_weight,
         physics_time_weight=args.physics_time_weight,
+        physics_alpha_bar_min=args.physics_alpha_bar_min,
     )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -404,6 +419,12 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--epochs", type=int, default=100)
     train_parser.add_argument("--batch-size", type=int, default=64)
     train_parser.add_argument("--learning-rate", type=float, default=2.0e-4)
+    train_parser.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="Warm-start model weights from a compatible checkpoint.",
+    )
     train_parser.add_argument("--hidden-channels", type=int, default=128)
     train_parser.add_argument("--num-layers", type=int, default=6)
     train_parser.add_argument("--diffusion-steps", type=int, default=200)
@@ -436,6 +457,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("none", "alpha_bar"),
         default="alpha_bar",
         help="Down-weight unreliable physics gradients at noisy diffusion steps.",
+    )
+    train_parser.add_argument(
+        "--physics-alpha-bar-min",
+        type=float,
+        default=0.0,
+        help="Apply AC residual only when alpha_bar is at least this value.",
     )
     train_parser.add_argument("--pf-scale-mw", type=float, default=1.0)
     train_parser.add_argument("--pf-scale-mvar", type=float, default=1.0)
