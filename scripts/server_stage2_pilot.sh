@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# 阶段2：在30拓扑开发集上搜索物理损失量级，不接触正式测试结果。
+# 阶段2：在30拓扑开发集上搜索物理损失量级，不接触正式数据集。
+# 本阶段采用单因素设计：只改变 AC 物理损失权重，电压损失固定为 0。
 
 set -euo pipefail
 
@@ -36,11 +37,6 @@ for physics_weight in 0 1e-5 1e-4 1e-3; do
     exit 1
   fi
 
-  voltage_weight="0"
-  if [[ "${physics_weight}" != "0" ]]; then
-    voltage_weight="1.0"
-  fi
-
   uv run --locked ieee33-run train \
     --data "${dev_data}" \
     --output-dir "${output_dir}" \
@@ -52,7 +48,7 @@ for physics_weight in 0 1e-5 1e-4 1e-3; do
     --num-layers 4 \
     --diffusion-steps 100 \
     --physics-weight "${physics_weight}" \
-    --voltage-weight "${voltage_weight}" \
+    --voltage-weight 0 \
     --physics-time-weight alpha_bar \
     --device "${device}" \
     --seed 2026
@@ -74,4 +70,41 @@ for physics_weight in 0 1e-5 1e-4 1e-3; do
     --seed 2026
 done
 
-echo "Stage 2 complete. Return the four metrics.json files for weight selection."
+uv run --locked python - <<'PY'
+import json
+from pathlib import Path
+
+summary = []
+for output_dir in sorted(Path("outputs").glob("pilot_graph_pf*_seed2026")):
+    config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
+    history = json.loads((output_dir / "history.json").read_text(encoding="utf-8"))
+    metrics = json.loads((output_dir / "metrics.json").read_text(encoding="utf-8"))
+    best = min(history, key=lambda row: row["val_total"])
+    summary.append(
+        {
+            "experiment": output_dir.name,
+            "physics_weight": config["training_loss_config"]["physics_weight"],
+            "best_epoch": best["epoch"],
+            "best_val_total": best["val_total"],
+            "best_val_noise": best["val_noise"],
+            "best_val_physics": best["val_physics"],
+            "wasserstein_per_channel": metrics["distribution"]["wasserstein_per_channel"],
+            "generated_to_real_std_ratio": metrics["distribution"]["generated_to_real_std_ratio"],
+            "mmd_rbf_squared": metrics["mmd_rbf_squared"],
+            "correlation_error": metrics["normalized_correlation_frobenius_error"],
+            "mean_absolute_residual": metrics["physics"]["mean_absolute_residual"],
+            "p95_absolute_residual": metrics["physics"]["p95_absolute_residual"],
+            "p99_absolute_residual": metrics["physics"]["p99_absolute_residual"],
+            "maximum_absolute_residual": metrics["physics"]["maximum_absolute_residual"],
+            "physics_feasible_rate_at_1e-2": metrics["physics"]["physics_feasible_rate"],
+            "voltage_violation_rate": metrics["voltage_violation_rate"],
+            "nearest_reference_mean": metrics["nearest_reference_mean"],
+        }
+    )
+
+destination = Path("docs/pilot_physics_weight_summary.json")
+destination.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+print(f"Pilot summary written to: {destination}")
+PY
+
+echo "Stage 2 complete. Return docs/pilot_physics_weight_summary.json for weight selection."
